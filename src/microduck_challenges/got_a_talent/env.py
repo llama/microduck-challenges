@@ -186,11 +186,83 @@ from mjlab_microduck.tasks.microduck_velocity_env_cfg import (
 )
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
+from . import rewards as dizzy
+
+# ── Dizzy Duck (the spin) ─────────────────────────────────────────────────────
+# Stage A ("spin"): standing starts only, no sit commands, short dwell: the
+# policy discovers the pirouette with nothing else to earn. Stage B ("full",
+# the challenge's own task): the stock sit/stand/head recipe plus the spin
+# command, warm-started from stage A. Same observations, same command layout.
+SPIN_STAGES = ("spin", "full")
+SPIN_PROB            = {"spin": 0.6, "full": 0.0}   # "full" starts at 0: see SPIN_PROB_STAGES
+# Stage B curriculum (B7, 2026-10-12): the stock sit/stand recipe alone for the first
+# 1000 iterations, then spin segments ramp in once standing and sitting exist.
+SPIN_PROB_STAGES     = [{"step": 0, "prob": 0.35}]   # B8: warm from B7@1250 (sit/stand known), spin from step 0
+SPIN_BOOTSTRAP_WEIGHT = 2.0   # B8 (the published Dizzy Duck): any yaw rate pays while spinning; B7 stood still through spins
+SPIN_BOOTSTRAP_MIN_RATE = 0.0 # no deadzone: B9 tried 1.0 with weight 1 and entropy 0 and never started spinning
+SPIN_BOOTSTRAP_FULL_RATE = 3.0
+ENTROPY_COEF         = 0.01   # B8: std spikes to 1.2 around iter 500 while the spin is found, then recovers by 1000
+SPIN_REST_FLOOR      = 0.3    # upright_linear / posture_height / upright_while_tall keep 30 % during spins
+SIT_PROB_BY_STAGE    = {"spin": 0.0, "full": 0.5}
+DWELL_BY_STAGE       = {"spin": (2.0, 4.0), "full": (3.5, 6.5)}
+EPISODE_BY_STAGE     = {"spin": 8.0, "full": 12.0}
+# Spin style. "wild" = the v1 recipe (run spin_a2): the whirl Doug picked for the
+# show — 15-20 rad/s, head as the propeller, no style costs. "pirouette" = the
+# v2/v3 style costs (runs spin_a3/spin_a4): upright, head held, foot lifted,
+# capped near 8 rad/s. Stage B trains the challenge task with SPIN_STYLE.
+SPIN_STYLE = "fastwilder"
+SPIN_STYLES = {
+    "wild": dict(step_cap=0.3, coast_full=6.0, upright_cos=0.5, drift_w=-3.0, drift_r=0.03, head_floor=0.3,
+                 tilt_w=0.0, head_vel_w=0.0, overspeed_w=0.0, lift_w=0.0, head_pose_w=0.0),
+    "pirouette": dict(step_cap=0.16, coast_full=5.0, upright_cos=0.85, drift_w=-10.0, drift_r=0.02, head_floor=1.0,
+                      tilt_w=-20.0, head_vel_w=-0.005, overspeed_w=-0.5, lift_w=3.0, head_pose_w=-3.0),
+    # "fast": v1's speed (no cap, no overspeed cost, head free) but an upright trunk,
+    # a lifted foot and the spot held — Doug 2026-10-12: faster = more impressive.
+    "fast": dict(step_cap=0.4, coast_full=12.0, upright_cos=0.7, drift_w=-6.0, drift_r=0.03, head_floor=0.3,
+                 tilt_w=-10.0, head_vel_w=0.0, overspeed_w=0.0, lift_w=2.0, head_pose_w=0.0),
+    # "wilder" (Doug 2026-10-12, after B1@250): v1's look but faster if possible, more
+    # rotation on each foot (touchdowns cost, long one-foot streaks pay), the free
+    # foot lifted higher (4 cm). Head free, no tilt cost. The show's style.
+    "wilder": dict(step_cap=0.6, coast_full=15.0, upright_cos=0.5, drift_w=-6.0, drift_r=0.03, head_floor=0.3,
+                   tilt_w=0.0, head_vel_w=0.0, overspeed_w=0.0, lift_w=3.0, head_pose_w=0.0,
+                   lift_target=0.04, touchdown_w=-3.0, streak_w=2.0),
+    # "fastwilder": wilder + the fast run's upright-trunk cost (spin_a5@750 reached 17 rad/s
+    # with the trunk vertical and the foot visibly lifted). A/B against wilder (B4 vs B5).
+    "fastwilder": dict(step_cap=0.6, coast_full=15.0, upright_cos=0.7, drift_w=-6.0, drift_r=0.03, head_floor=0.3,
+                       tilt_w=-10.0, head_vel_w=0.0, overspeed_w=0.0, lift_w=3.0, head_pose_w=0.0,
+                       lift_target=0.04, touchdown_w=-3.0, streak_w=2.0, head_drop_w=-60.0),
+}
+# head_drop_w: (0.18 m − skull height)₊ while spinning (B4/B5 from scratch spun as a
+# head-and-foot tripod, head on the floor: ~0.13 m below → −7.8/step, above the spin's income).
+for _st in SPIN_STYLES.values():
+    _st.setdefault("lift_target", 0.025); _st.setdefault("touchdown_w", 0.0); _st.setdefault("streak_w", 0.0)
+    _st.setdefault("head_drop_w", 0.0)
+_STYLE = SPIN_STYLES[SPIN_STYLE]
+SPIN_PROGRESS_WEIGHT = 30.0   # Δyaw (rad/step), capped at SPIN_STEP_CAP
+SPIN_STEP_CAP        = _STYLE["step_cap"]
+SPIN_COAST_WEIGHT    = 2.0    # ≤ 1/step while coasting ≥ SPIN_COAST_FULL rad/s on one foot
+SPIN_COAST_FULL      = _STYLE["coast_full"]
+SPIN_UPRIGHT_COS     = _STYLE["upright_cos"]
+SPIN_DRIFT_WEIGHT    = _STYLE["drift_w"]
+SPIN_DRIFT_RADIUS    = _STYLE["drift_r"]
+SPIN_HEAD_FLOOR      = _STYLE["head_floor"]
+SPIN_TILT_WEIGHT     = _STYLE["tilt_w"]
+SPIN_HEAD_VEL_WEIGHT = _STYLE["head_vel_w"]
+SPIN_OVERSPEED_WEIGHT = _STYLE["overspeed_w"]
+SPIN_OVERSPEED_RATE  = 9.0
+SPIN_LIFT_WEIGHT     = _STYLE["lift_w"]
+SPIN_LIFT_TARGET     = _STYLE["lift_target"]
+SPIN_HEAD_POSE_WEIGHT = _STYLE["head_pose_w"]
+
 
 def make_env_cfg(
     play: bool = False,
+    stage: str = "full",
+    style: str = SPIN_STYLE,
 ) -> ManagerBasedRlEnvCfg:
-    """MicroDuck Got a Talent's training environment."""
+    """MicroDuck Got a Talent's training environment (`stage`: see SPIN_STAGES; `style`: SPIN_STYLES)."""
+    assert stage in SPIN_STAGES, stage
+    st = SPIN_STYLES[style]
 
     # The knobs a novice tunes, from challenge.toml beside this file.
     knobs = challenge.params(__file__)
@@ -234,7 +306,7 @@ def make_env_cfg(
     cfg.scene.sensors  = (feet_ground_cfg, self_collision_cfg)
     cfg.viewer.body_name = "trunk_base"
 
-    cfg.episode_length_s = EPISODE_LENGTH_S
+    cfg.episode_length_s = EPISODE_BY_STAGE[stage]
 
     # ── Actions ───────────────────────────────────────────────────────────────
     joint_pos_action = cfg.actions["joint_pos"]
@@ -450,6 +522,84 @@ def make_env_cfg(
         },
     )
 
+    # ── Dizzy Duck: no resting income under a spin command, spin terms on ──
+    # The four terms that pay for being AT the commanded posture are gated to
+    # zero while twist[2] is up (standing still would otherwise out-earn any
+    # attempt); head tracking keeps a floor so the head stays commandable.
+    for name in ("posture_pose_legs", "posture_pose_l1", "posture_stillness", "posture_composite"):
+        term = cfg.rewards[name]
+        cfg.rewards[name] = RewardTermCfg(
+            func=dizzy.unless_spinning, weight=term.weight,
+            params={"inner": term.func, "params": term.params, "command_name": "twist"},
+        )
+    # B8: the always-on stand terms are what made standing still through a spin
+    # segment comfortable (B7); keep a floor so a spin that tilts still pays for upright.
+    for name in ("upright_linear", "upright_while_tall", "posture_height", "posture_height_sharp"):
+        term = cfg.rewards[name]
+        cfg.rewards[name] = RewardTermCfg(
+            func=dizzy.unless_spinning, weight=term.weight,
+            params={"inner": term.func, "params": term.params, "command_name": "twist",
+                    "floor": SPIN_REST_FLOOR},
+        )
+    head = cfg.rewards["head_pose_tracking"]
+    cfg.rewards["head_pose_tracking"] = RewardTermCfg(
+        func=dizzy.unless_spinning, weight=head.weight,
+        params={"inner": head.func, "params": head.params, "command_name": "twist",
+                "floor": st["head_floor"]},
+    )
+    cfg.rewards["spin_progress"] = RewardTermCfg(
+        func=dizzy.spin_progress, weight=SPIN_PROGRESS_WEIGHT,
+        params={"command_name": "twist", "sensor_name": feet_ground_cfg.name,
+                "max_step_rad": st["step_cap"], "min_upright_cos": st["upright_cos"]},
+    )
+    cfg.rewards["spin_coast"] = RewardTermCfg(
+        func=dizzy.spin_coast, weight=SPIN_COAST_WEIGHT,
+        params={"command_name": "twist", "sensor_name": feet_ground_cfg.name,
+                "full_rate": st["coast_full"], "min_upright_cos": st["upright_cos"]},
+    )
+    cfg.rewards["spin_drift"] = RewardTermCfg(
+        func=dizzy.spin_drift, weight=st["drift_w"],
+        params={"command_name": "twist", "radius": st["drift_r"]},
+    )
+    # Style (v2): see rewards.py. All ≥ 0 and gated on the flag; costs carry negative weights.
+    cfg.rewards["spin_tilt"] = RewardTermCfg(
+        func=dizzy.spin_tilt, weight=st["tilt_w"], params={"command_name": "twist"},
+    )
+    cfg.rewards["spin_head_vel"] = RewardTermCfg(
+        func=dizzy.spin_head_vel, weight=st["head_vel_w"], params={"command_name": "twist"},
+    )
+    cfg.rewards["spin_overspeed"] = RewardTermCfg(
+        func=dizzy.spin_overspeed, weight=st["overspeed_w"],
+        params={"command_name": "twist", "max_rate": SPIN_OVERSPEED_RATE},
+    )
+    cfg.rewards["spin_swing_lift"] = RewardTermCfg(
+        func=dizzy.spin_swing_lift, weight=st["lift_w"],
+        params={"command_name": "twist", "sensor_name": feet_ground_cfg.name,
+                "min_upright_cos": st["upright_cos"], "clearance_target": st["lift_target"],
+                "asset_cfg": SceneEntityCfg("robot", site_names=("left_foot", "right_foot"))},
+    )
+    cfg.rewards["spin_head_pose"] = RewardTermCfg(
+        func=dizzy.spin_head_pose, weight=st["head_pose_w"],
+        params={"command_name": "twist", "head_command_name": "head_pose"},
+    )
+    cfg.rewards["spin_touchdowns"] = RewardTermCfg(
+        func=dizzy.spin_touchdowns, weight=st["touchdown_w"],
+        params={"command_name": "twist", "sensor_name": feet_ground_cfg.name},
+    )
+    cfg.rewards["spin_streak"] = RewardTermCfg(
+        func=dizzy.spin_streak, weight=st["streak_w"],
+        params={"command_name": "twist", "sensor_name": feet_ground_cfg.name},
+    )
+    cfg.rewards["spin_bootstrap"] = RewardTermCfg(
+        func=dizzy.spin_bootstrap, weight=SPIN_BOOTSTRAP_WEIGHT,
+        params={"command_name": "twist", "min_rate": SPIN_BOOTSTRAP_MIN_RATE, "full_rate": SPIN_BOOTSTRAP_FULL_RATE},
+    )
+    cfg.rewards["spin_head_drop"] = RewardTermCfg(
+        func=dizzy.spin_head_drop, weight=st["head_drop_w"],
+        params={"command_name": "twist", "min_z": 0.18,
+                "asset_cfg": SceneEntityCfg("robot", body_names=("jaw_soft",))},
+    )
+
     # ── Sim2real regularisers — MATCHED to velocity ─────────────────────────
     # velocity's exact set and absolute weights:
     #   • action_rate_l2: -0.1 at stage 0, ramped -0.1 → -1.0 by iter 1500
@@ -586,15 +736,17 @@ def make_env_cfg(
     command.rel_heading_envs  = 0.0
     command.heading_command   = False
     command.ranges.heading    = None
-    command.resampling_time_range = POSTURE_DWELL_S
+    command.resampling_time_range = DWELL_BY_STAGE[stage]
     command.debug_vis = False
-    cfg.commands["twist"] = microduck_mdp.SitStandCommandCfg(
+    # Dizzy Duck: cmd = [sit_flag, 0, spin_flag] (rewards.SpinSitStandCommand).
+    cfg.commands["twist"] = dizzy.SpinSitStandCommandCfg(
         **{
             **vars(command),
-            "sit_prob": SIT_PROB,
-            "ramp_s":   POSTURE_RAMP_S,
-            "sit_z":    SIT_Z,
-            "stand_z":  STAND_Z,
+            "sit_prob":  SIT_PROB_BY_STAGE[stage],
+            "spin_prob": SPIN_PROB[stage],
+            "ramp_s":    POSTURE_RAMP_S,
+            "sit_z":     SIT_Z,
+            "stand_z":   STAND_Z,
         }
     )
 
@@ -637,8 +789,8 @@ def make_env_cfg(
         params={
             "face_down_prob":          0.0,
             "face_up_prob":            0.0,
-            "sitting_prob":            0.5,
-            "standing_prob":           0.5,
+            "sitting_prob":            0.5 if stage == "full" else 0.0,
+            "standing_prob":           0.5 if stage == "full" else 1.0,
             "sitting_joint_overrides": SITTING_TARGET_OVERRIDES,
             "sitting_joint_noise_std": 0.10,           # ≈ 6° per joint
             "sitting_tilt_max":        math.radians(8),
@@ -764,6 +916,12 @@ def make_env_cfg(
     # ── Curriculum ────────────────────────────────────────────────────────────
     del cfg.curriculum["terrain_levels"]
     del cfg.curriculum["command_vel"]
+
+    if stage == "full":
+        cfg.curriculum["spin_prob"] = CurriculumTermCfg(
+            func=dizzy.spin_prob_curriculum,
+            params={"command_name": "twist", "stages": SPIN_PROB_STAGES},
+        )
 
     # Head pose command range curriculum — same per-joint widening as the
     # velocity/standup envs (5% → 100% of each joint's reachable delta).
@@ -920,7 +1078,7 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.01,
+        entropy_coef=ENTROPY_COEF,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-3,

@@ -11,18 +11,18 @@ seed           = 1
 
 [params.forward_reward]
 label = "Follow the speed order"
-value = 2.0
+value = 0.5   # race mode: the floor; race_speed (env.py) sets the pace
 min   = 0.5
 max   = 5.0
 
 [params.upright_reward]
 label = "Stay upright"
-value = 2.0
+value = 0.5   # race mode: the floor; fell_over (70 deg) is the hard limit
 min   = 0.5
 max   = 5.0
 
 [params.step_reward]
 label = "Lift your feet"
-value = 3.0
+value = 0.0   # race mode: no air-time window, the gallop picks its own
 min   = 0.0
 max   = 6.0

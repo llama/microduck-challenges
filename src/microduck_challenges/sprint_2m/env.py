@@ -30,6 +30,92 @@ from copy import deepcopy
 
 NUM_STEPS_PER_ENV = 24
 
+# === Race mode (2026-10-13) ===
+# The Arena's leaders cross 2 m in 0.98 s: a bounding gallop at 2.5 m/s that
+# ignores the commanded speed (the sweep then picks whatever vx it likes), with
+# the 0.5 s untimed settle used as a flying start. race_speed (rewards.py) pays
+# the trunk's speed along the spawn heading; the walking regularizers that
+# price a gallop (pose, foot clearance and swing, slip, angular momentum) are
+# zeroed, the knobs in challenge.toml sit at their floors, and episodes are
+# short so the policy is always accelerating from the STAND pose, which is
+# exactly what the Arena's settle and its first second ask for.
+RACE_VARIANTS = {
+    # speed: race_speed weight; head: head_pose_tracking weight (the leaders whip
+    # the head, so it is nearly free); action_rate: constant action_rate_l2
+    # weight (no ramp unless action_rate_ramp); pushes: the Arena has none.
+    "A": dict(speed=4.0, head=0.3, action_rate=-0.05, action_rate_ramp=False, pushes=False, episode_s=4.0, heading=2.0),
+    "B": dict(speed=4.0, head=0.0, action_rate=-0.02, action_rate_ramp=False, pushes=False, episode_s=4.0, heading=2.0),
+    "C": dict(speed=4.0, head=0.3, action_rate=-0.1, action_rate_ramp=True, pushes=True, episode_s=4.0, heading=2.0),
+    # A-C at iteration 750 ran a low crouched shuffle (1.37 s, trunk at 9-12 cm, 1.6 m/s);
+    # the leaders bound at 2.5 m/s with the trunk high and pitching. D flattens
+    # upright (std 1.0: the knob's weight stays, the gradient goes) and pays
+    # speed more; E also softens the joint-limit penalty and the action rate.
+    "D": dict(speed=6.0, head=0.0, action_rate=-0.05, action_rate_ramp=False, pushes=False, episode_s=4.0, heading=2.0, upright_std=1.0),
+    "E": dict(speed=6.0, head=0.0, action_rate=-0.02, action_rate_ramp=False, pushes=False, episode_s=4.0, heading=2.0, upright_std=1.0, dof_limits=-0.1),
+    # F: E plus a price on the crouch itself (trunk_low, rewards.py).
+    "F": dict(speed=6.0, head=0.0, action_rate=-0.02, action_rate_ramp=False, pushes=False, episode_s=4.0, heading=2.0, upright_std=1.0, dof_limits=-0.1, trunk_low=-20.0),
+    # G: the race itself. The leader runs nose-down 15 deg on average and 54 deg at
+    # the line: a controlled fall that outlasts the 1.5 s race. A 4 s episode must
+    # stay up, so A-F run level. G ends the episode at the line (finish, m), pays a
+    # clock (alive, per second) so a quicker race is a better one, and a bonus for
+    # crossing; speed's integral is then the distance, and only time is left.
+    "G": dict(speed=6.0, head=0.0, action_rate=-0.02, action_rate_ramp=False, pushes=False, episode_s=3.0, heading=2.0, upright_std=1.0, dof_limits=-0.1, finish=2.0, alive=-1.0, finish_bonus=100.0),
+    # H: G with the training fall at 85 deg instead of 70, the Arena's own fall being 60 deg held 0.3 s.
+    "H": dict(speed=6.0, head=0.0, action_rate=-0.02, action_rate_ramp=False, pushes=False, episode_s=3.0, heading=2.0, upright_std=1.0, dof_limits=-0.1, finish=2.0, alive=-1.0, finish_bonus=100.0, fall_deg=85.0),
+    # I: D with the speed squared (power 2), so the top end pays; J: D with twice the entropy (a different optimum?).
+    "I": dict(speed=8.0, power=2.0, head=0.0, action_rate=-0.02, action_rate_ramp=False, pushes=False, episode_s=4.0, heading=2.0, upright_std=1.0, dof_limits=-0.1),
+    "J": dict(speed=6.0, head=0.0, action_rate=-0.05, action_rate_ramp=False, pushes=False, episode_s=4.0, heading=2.0, upright_std=1.0, entropy=0.02),
+    # T: the fine-tune of a transplanted policy (warm_sprint/warm.pt carries the Arena
+    # leader's actor, see scratchpad/transplant.py). G's race objective, the training fall at
+    # the Arena's 60 deg, a low learning rate and a small initial action noise so PPO's first
+    # updates (a critic still learning the new rewards) cannot wreck the gait, checkpoints every 100.
+    "T": dict(speed=6.0, head=0.0, action_rate=-0.02, action_rate_ramp=False, pushes=False, episode_s=3.0, heading=2.0, upright_std=1.0, dof_limits=-0.1, finish=2.0, alive=-1.0, finish_bonus=100.0, fall_deg=60.0, lr=2e-4, init_std=0.3, entropy=0.0, save_interval=100),
+    # U (T with noise 0.5, lr 5e-4) lost the gait in 100 iterations: 0.964 -> 1.57 s. The critic
+    # it inherits priced another reward, so PPO's first updates push the actor on nonsense
+    # advantages. V and W freeze the actor for the first `critic_warmup` updates, keep the
+    # learning rate fixed (no adaptive climb), and keep the action noise small.
+    "V": dict(speed=6.0, head=0.0, action_rate=-0.02, action_rate_ramp=False, pushes=False, episode_s=3.0, heading=2.0, upright_std=1.0, dof_limits=-0.1, finish=2.0, alive=-1.0, finish_bonus=100.0, fall_deg=60.0, lr=1e-4, init_std=0.2, entropy=0.0, save_interval=100, schedule="fixed", critic_warmup=60),
+    "W": dict(speed=6.0, head=0.0, action_rate=-0.02, action_rate_ramp=False, pushes=False, episode_s=3.0, heading=2.0, upright_std=1.0, dof_limits=-0.1, finish=2.0, alive=-1.0, finish_bonus=100.0, fall_deg=60.0, lr=2e-4, init_std=0.3, entropy=0.0, save_interval=100, schedule="fixed", critic_warmup=100),
+    # W, actor frozen, showed the training env itself breaks the leader's gait: 71% of episodes
+    # ended at the instant 60 deg cut-off and only 12% finished, under 0.3 rad action noise and
+    # full domain randomization. X judges falls as the Arena does (60 deg held 0.3 s), shrinks
+    # every randomization range to a tenth (the Arena runs the nominal values anyway), and
+    # explores with 0.1 rad of noise.
+    "X": dict(speed=6.0, head=0.0, action_rate=-0.02, action_rate_ramp=False, pushes=False, episode_s=3.0, heading=2.0, upright_std=1.0, dof_limits=-0.1, finish=2.0, alive=-1.0, finish_bonus=100.0, fall_deg=89.0, arena_fall=True, narrow_dr=0.1, lr=1e-4, init_std=0.1, entropy=0.0, save_interval=100, schedule="fixed", critic_warmup=100),
+    # X, actor frozen, still toppled in half its episodes: the actor's observations carry
+    # uniform noise here (gravity, joint positions and velocities, last action) and the Arena
+    # adds none. Y strips that noise and explores with 0.05 rad.
+    "Y": dict(speed=6.0, head=0.0, action_rate=-0.02, action_rate_ramp=False, pushes=False, episode_s=3.0, heading=2.0, upright_std=1.0, dof_limits=-0.1, finish=2.0, alive=-1.0, finish_bonus=100.0, fall_deg=89.0, arena_fall=True, narrow_dr=0.1, no_obs_noise=True, lr=1e-4, init_std=0.05, entropy=0.0, save_interval=100, schedule="fixed", critic_warmup=100),
+}
+
+RACE_VARIANT = "A"
+
+# Critic warm-up for a transplanted actor: the first `critic_warmup` PPO updates train the
+# critic alone (actor parameters frozen), so the actor only moves once the advantages mean
+# something. Installed at import, like mjlab_microduck's own patches.
+_CRITIC_WARMUP = RACE_VARIANTS[RACE_VARIANT].get("critic_warmup", 0)
+if _CRITIC_WARMUP:
+    from rsl_rl.algorithms.ppo import PPO as _PPO
+
+    _orig_ppo_update = _PPO.update
+
+    def _update_with_critic_warmup(self, *args, **kwargs):
+        done = getattr(self, "_race_updates", 0)
+        self._race_updates = done + 1
+        if done >= _CRITIC_WARMUP:
+            return _orig_ppo_update(self, *args, **kwargs)
+        for p in self.actor.parameters():
+            p.requires_grad_(False)
+        try:
+            if done == 0:
+                print(f"[sprint] critic warm-up: actor frozen for the first {_CRITIC_WARMUP} updates")
+            return _orig_ppo_update(self, *args, **kwargs)
+        finally:
+            for p in self.actor.parameters():
+                p.requires_grad_(True)
+
+    _PPO.update = _update_with_critic_warmup
+
 # Symmetry
 ENABLE_SYMMETRY = False
 
@@ -123,6 +209,8 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab_microduck import challenge
 from mjlab_microduck.robot.microduck_constants import MICRODUCK_WALK_ROBOT_CFG
 from mjlab_microduck.tasks import mdp as microduck_mdp
+
+from microduck_challenges.sprint_2m import rewards as sprint_rewards
 from mjlab_microduck.tasks.symmetry import PpoWithSymmetryCfg, SYMMETRY_CFG
 
 
@@ -823,7 +911,74 @@ def make_env_cfg(
         },
     )
 
+    _apply_race_mode(cfg, RACE_VARIANTS[RACE_VARIANT], play)
     return cfg
+
+
+def _apply_race_mode(cfg: ManagerBasedRlEnvCfg, v: dict, play: bool) -> None:
+    """Turn the walking recipe above into the race: see RACE_VARIANTS."""
+    cfg.rewards["race_speed"] = RewardTermCfg(
+        func=sprint_rewards.race_speed, weight=v["speed"], params={"clip": 4.0, "power": v.get("power", 1.0)}
+    )
+    for name in ("pose", "foot_clearance", "foot_swing_height", "foot_slip", "body_ang_vel", "angular_momentum"):
+        cfg.rewards[name].weight = 0.0
+    cfg.rewards["head_pose_tracking"].weight = v["head"]
+    cfg.rewards["head_pose_bias"].weight = 0.0
+    cfg.curriculum.pop("head_pose_bias_weight", None)
+    cfg.rewards["heading_hold"].weight = v["heading"]
+    cfg.rewards["action_rate_l2"].weight = v["action_rate"]
+    if not v["action_rate_ramp"]:
+        cfg.curriculum.pop("action_rate_weight", None)
+    # Never a standing env: every episode is a start.
+    cfg.curriculum.pop("standing_envs", None)
+    cfg.commands["twist"].rel_standing_envs = 0.0
+    if not v["pushes"]:
+        cfg.events.pop("push_robot", None)
+    cfg.episode_length_s = v["episode_s"]
+    if "upright_std" in v:
+        cfg.rewards["upright"].params["std"] = v["upright_std"]
+    if "dof_limits" in v:
+        cfg.rewards["dof_pos_limits"].weight = v["dof_limits"]
+    if "trunk_low" in v:
+        cfg.rewards["trunk_low"] = RewardTermCfg(
+            func=sprint_rewards.trunk_low, weight=v["trunk_low"], params={"target": 0.125}
+        )
+    if "finish" in v:
+        cfg.terminations["finished"] = TerminationTermCfg(
+            func=sprint_rewards.finished_race, params={"distance": v["finish"]}
+        )
+        cfg.rewards["clock"] = RewardTermCfg(func=mdp.is_alive, weight=v["alive"])
+        cfg.rewards["finish_bonus"] = RewardTermCfg(
+            func=sprint_rewards.finish_bonus, weight=v["finish_bonus"], params={"distance": v["finish"]}
+        )
+    if "fall_deg" in v:
+        cfg.terminations["fell_over"].params["limit_angle"] = math.radians(v["fall_deg"])
+    if v.get("arena_fall"):
+        cfg.terminations["arena_fall"] = TerminationTermCfg(func=sprint_rewards.arena_fall, params={"hold_steps": 15})
+    if v.get("narrow_dr"):
+        _narrow_domain_randomization(cfg, v["narrow_dr"])
+    if v.get("no_obs_noise"):
+        for term in cfg.observations["actor"].terms.values():
+            term.noise = None
+
+
+def _narrow_domain_randomization(cfg: ManagerBasedRlEnvCfg, factor: float) -> None:
+    """Shrink every randomization range to `factor` of its width about its neutral value
+    (1 for a scale, 0 for an offset); the Arena simulates the nominal robot."""
+    def shrink(r):
+        lo, hi = float(r[0]), float(r[1])
+        c = 1.0 if (0.0 < lo <= 1.0 <= hi) else (0.0 if lo <= 0.0 <= hi else (lo + hi) / 2)
+        return (c + (lo - c) * factor, c + (hi - c) * factor)
+    for name, term in cfg.events.items():
+        for key in ("ranges", "scale_range", "bias_range"):
+            r = term.params.get(key) if isinstance(term.params, dict) else None
+            if isinstance(r, (tuple, list)) and len(r) == 2 and all(isinstance(x, (int, float)) for x in r):
+                term.params[key] = shrink(r)
+    for name in ("com_range", "head_com_range"):
+        cfg.curriculum.pop(name, None)
+    for term in cfg.observations["actor"].terms.values():
+        if isinstance(term.params, dict) and "max_angle_deg" in term.params:
+            term.params["max_angle_deg"] = term.params["max_angle_deg"] * factor
 
 
 RL_CFG = RslRlOnPolicyRunnerCfg(
@@ -833,7 +988,7 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
         obs_normalization=True,
         distribution_cfg={
             "class_name": "GaussianDistribution",
-            "init_std": 1.0,
+            "init_std": RACE_VARIANTS[RACE_VARIANT].get("init_std", 1.0),
             "std_type": "scalar",
         },
     ),
@@ -846,11 +1001,11 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.01,
+        entropy_coef=RACE_VARIANTS[RACE_VARIANT].get("entropy", 0.01),
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-3,
-        schedule="adaptive",
+        learning_rate=RACE_VARIANTS[RACE_VARIANT].get("lr", 1.0e-3),
+        schedule=RACE_VARIANTS[RACE_VARIANT].get("schedule", "adaptive"),
         gamma=0.99,
         lam=0.95,
         desired_kl=0.01,
@@ -860,7 +1015,7 @@ RL_CFG = RslRlOnPolicyRunnerCfg(
     wandb_project="mjlab_microduck",
     experiment_name="sprint_2m",  # logs/rsl_rl/sprint_2m/
     run_name="sprint_2m",
-    save_interval=250,
+    save_interval=RACE_VARIANTS[RACE_VARIANT].get("save_interval", 250),
     num_steps_per_env=24,
     max_iterations=50_000,
 )
